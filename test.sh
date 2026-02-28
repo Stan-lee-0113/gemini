@@ -1,8 +1,7 @@
 #!/bin/bash
-# 优化的 GCP API 密钥管理工具 (增强版)
+# 优化的 GCP API 密钥管理工具
 # 支持 Gemini API 和 Vertex AI
-# 新增: 极速双模一键生成流程
-# 版本: 2.2.0
+# 版本: 2.1.1 (新增融合极速版)
 
 # 仅启用 errtrace (-E) 与 nounset (-u)
 set -Euo
@@ -18,17 +17,19 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # ===== 全局配置 =====
-VERSION="2.2.0"
-LAST_UPDATED="2025-08-27"
+# 版本信息
+VERSION="2.1.1"
+LAST_UPDATED="2025-08-28"
 
 # 通用配置
 PROJECT_PREFIX="${PROJECT_PREFIX:-gemini-key}"
 MAX_RETRY_ATTEMPTS="${MAX_RETRY:-3}"
 MAX_PARALLEL_JOBS="${CONCURRENCY:-20}"
-TEMP_DIR=""  
+TEMP_DIR=""  # 将在初始化时设置
 
 # Gemini模式配置
 TIMESTAMP=$(date +%s)
+# 改进的随机字符生成（兼容性更好）
 if command -v openssl &>/dev/null; then
     RANDOM_CHARS=$(openssl rand -hex 2)
 else
@@ -38,25 +39,42 @@ EMAIL_USERNAME="momo${RANDOM_CHARS}${TIMESTAMP:(-4)}"
 GEMINI_TOTAL_PROJECTS=175
 PURE_KEY_FILE="key.txt"
 COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
-KEY_DIR="${KEY_DIR:-./keys}"
+AGGREGATED_KEY_FILE="aggregated_verbose_keys_${EMAIL_USERNAME}.txt"
+DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
+CLEANUP_LOG="api_keys_cleanup_$(date +%Y%m%d_%H%M%S).log"
 
 # Vertex模式配置
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-}"
 VERTEX_PROJECT_PREFIX="${VERTEX_PROJECT_PREFIX:-vertex}"
 MAX_PROJECTS_PER_ACCOUNT=${MAX_PROJECTS_PER_ACCOUNT:-3}
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-vertex-admin}"
+KEY_DIR="${KEY_DIR:-./keys}"
+ENABLE_EXTRA_ROLES=("roles/iam.serviceAccountUser" "roles/aiplatform.user")
 
 # ===== 初始化 =====
-TEMP_DIR=$(mktemp -d -t gcp_script_XXXXXX) || { echo "错误：无法创建临时目录"; exit 1; }
-mkdir -p "$KEY_DIR" 2>/dev/null || { echo "错误：无法创建密钥目录 $KEY_DIR"; exit 1; }
+# 创建唯一的临时目录
+TEMP_DIR=$(mktemp -d -t gcp_script_XXXXXX) || {
+    echo "错误：无法创建临时目录"
+    exit 1
+}
+
+# 创建密钥目录
+mkdir -p "$KEY_DIR" 2>/dev/null || {
+    echo "错误：无法创建密钥目录 $KEY_DIR"
+    exit 1
+}
 chmod 700 "$KEY_DIR" 2>/dev/null || true
+
+# 开始计时
 SECONDS=0
 
-# ===== 日志函数 =====
+# ===== 日志函数（带颜色） =====
 log() { 
     local level="${1:-INFO}"
     local msg="${2:-}"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
     case "$level" in
         "INFO")     echo -e "${CYAN}[${timestamp}] [INFO] ${msg}${NC}" ;;
         "SUCCESS")  echo -e "${GREEN}[${timestamp}] [SUCCESS] ${msg}${NC}" ;;
@@ -70,10 +88,22 @@ log() {
 handle_error() {
     local exit_code=$?
     local line_no=$1
+    
+    # 忽略某些非严重错误
     case $exit_code in
-        141|130) return 0 ;; # SIGPIPE/Ctrl+C
+        141)  # SIGPIPE
+            return 0
+            ;;
+        130)  # Ctrl+C
+            log "INFO" "用户中断操作"
+            exit 130
+            ;;
     esac
+    
+    # 记录错误
     log "ERROR" "在第 ${line_no} 行发生错误 (退出码 ${exit_code})"
+    
+    # 严重错误才终止
     if [ $exit_code -gt 1 ]; then
         log "ERROR" "发生严重错误，请检查日志"
         return $exit_code
@@ -82,404 +112,1256 @@ handle_error() {
         return 0
     fi
 }
+
+# 设置错误处理
 trap 'handle_error $LINENO' ERR
 
 # ===== 清理函数 =====
 cleanup_resources() {
     local exit_code=$?
-    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then rm -rf "$TEMP_DIR" 2>/dev/null || true; fi
+    
+    # 清理临时文件
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
+        log "INFO" "已清理临时文件"
+    fi
+    
+    # 如果是正常退出，显示感谢信息
     if [ $exit_code -eq 0 ]; then
         echo -e "\n${CYAN}感谢使用 GCP API 密钥管理工具${NC}"
+        echo -e "${YELLOW}请记得检查并删除不需要的项目以避免额外费用${NC}"
     fi
 }
+
+# 设置退出处理
 trap cleanup_resources EXIT
 
 # ===== 工具函数 =====
+
+# 改进的重试函数（支持命令）
 retry() {
     local max_attempts="$MAX_RETRY_ATTEMPTS"
     local attempt=1
+    local delay
+    
     while [ $attempt -le $max_attempts ]; do
-        if "$@"; then return 0; fi
+        if "$@"; then
+            return 0
+        fi
+        
         local error_code=$?
-        if [ $attempt -ge $max_attempts ]; then return $error_code; fi
-        sleep $(( attempt * 3 ))
+        
+        if [ $attempt -ge $max_attempts ]; then
+            log "ERROR" "命令在 ${max_attempts} 次尝试后失败: $*"
+            return $error_code
+        fi
+        
+        delay=$(( attempt * 10 + RANDOM % 5 ))
+        log "WARN" "重试 ${attempt}/${max_attempts}: $* (等待 ${delay}s)"
+        sleep $delay
         attempt=$((attempt + 1)) || true
     done
 }
 
-require_cmd() { if ! command -v "$1" &>/dev/null; then log "ERROR" "缺少依赖: $1"; exit 1; fi; }
+# 检查命令是否存在
+require_cmd() { 
+    if ! command -v "$1" &>/dev/null; then
+        log "ERROR" "缺少依赖: $1"
+        exit 1
+    fi
+}
 
+# 交互确认（支持非交互式环境）
 ask_yes_no() {
     local prompt="$1"
     local default="${2:-N}"
-    if [ ! -t 0 ]; then
-        [[ "$default" =~ ^[Yy]$ ]] && return 0 || return 1
-    fi
     local resp
-    read -r -p "${prompt} [y/N]: " resp || resp="$default"
+    
+    # 非交互式环境
+    if [ ! -t 0 ]; then
+        if [[ "$default" =~ ^[Yy]$ ]]; then
+            log "INFO" "非交互式环境，自动选择: 是"
+            return 0
+        else
+            log "INFO" "非交互式环境，自动选择: 否"
+            return 1
+        fi
+    fi
+    
+    # 交互式环境
+    if [[ "$default" == "N" ]]; then
+        read -r -p "${prompt} [y/N]: " resp || resp="$default"
+    else
+        read -r -p "${prompt} [Y/n]: " resp || resp="$default"
+    fi
+    
     resp=${resp:-$default}
     [[ "$resp" =~ ^[Yy]$ ]]
 }
 
+# 生成唯一后缀
 unique_suffix() { 
-    if command -v uuidgen &>/dev/null; then uuidgen | tr -d '-' | cut -c1-6 | tr '[:upper:]' '[:lower:]'
-    else echo "$(date +%s%N)${RANDOM}" | sha256sum | cut -c1-6; fi
+    if command -v uuidgen &>/dev/null; then
+        uuidgen | tr -d '-' | cut -c1-6 | tr '[:upper:]' '[:lower:]'
+    else
+        echo "$(date +%s%N 2>/dev/null || date +%s)${RANDOM}" | sha256sum | cut -c1-6
+    fi
 }
 
+# 生成项目ID
 new_project_id() {
     local prefix="${1:-$PROJECT_PREFIX}"
-    echo "${prefix}-$(unique_suffix)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-30
+    local suffix
+    suffix=$(unique_suffix)
+    echo "${prefix}-${suffix}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | cut -c1-30
 }
 
+# 安全检测服务是否已启用
 is_service_enabled() {
-    gcloud services list --enabled --project="$1" --filter="name:$2" --format='value(name)' 2>/dev/null | grep -q .
-}
-
-check_env() {
-    log "INFO" "检查环境配置..."
-    require_cmd gcloud
-    if ! gcloud config list account --quiet &>/dev/null; then log "ERROR" "请先运行 'gcloud init'"; exit 1; fi
-    log "SUCCESS" "环境检查通过"
-}
-
-enable_services() {
     local proj="$1"
-    shift
-    local services=("$@")
-    if [ ${#services[@]} -eq 0 ]; then
-        services=("aiplatform.googleapis.com" "iam.googleapis.com" "iamcredentials.googleapis.com" "cloudresourcemanager.googleapis.com")
-    fi
-    log "INFO" "启用API: ${services[*]}"
-    local failed=0
-    for svc in "${services[@]}"; do
-        if is_service_enabled "$proj" "$svc"; then continue; fi
-        if ! retry gcloud services enable "$svc" --project="$proj" --quiet; then
-            log "ERROR" "无法启用服务: ${svc}"
-            failed=$((failed + 1))
-        fi
-    done
-    return $failed
-}
-
-show_progress() {
-    local completed="${1:-0}"
-    local total="${2:-1}"
-    if [ "$total" -le 0 ]; then return; fi
-    if [ "$completed" -gt "$total" ]; then completed=$total; fi
-    local percent=$((completed * 100 / total))
-    printf "\r进度: %3d%% (%d/%d)" "$percent" "$completed" "$total"
-    if [ "$completed" -eq "$total" ]; then echo; fi
-}
-
-parse_json() {
-    local json="$1"
-    local field="$2"
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r "$field" 2>/dev/null | grep -v "null" && return 0
-    fi
-    if [ "$field" = ".keyString" ]; then
-        echo "$json" | grep -o '"keyString":"[^"]*"' | sed 's/"keyString":"//;s/"$//' | head -n 1
-        return 0
-    fi
-    return 1
-}
-
-# 自动解绑结算账户 (核心复用逻辑)
-unlink_projects_from_billing_account() {
-    local billing_id="$1"
-    if [ -z "$billing_id" ]; then return 1; fi
-    log "INFO" "正在扫描结算账户关联的项目..."
-    local linked_projects
-    linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
-    if [ -z "$linked_projects" ]; then
-        log "SUCCESS" "未发现占用结算账户的项目。"
-        return 0
-    fi
-    log "WARN" "发现旧项目占用，开始执行强制解绑..."
-    local project_array=()
-    while IFS= read -r line; do
-        [ -n "$line" ] && project_array+=("$line")
-    done <<< "$linked_projects"
+    local svc="$2"
     
-    for project_id in "${project_array[@]}"; do
-        if retry gcloud billing projects unlink "$project_id" --quiet; then
-            log "SUCCESS" "已解绑旧项目: ${project_id}"
-        else
-            log "WARN" "解绑失败: ${project_id} (可能无权限)"
-        fi
-    done
+    gcloud services list --enabled --project="$proj" --filter="name:${svc}" --format='value(name)' 2>/dev/null | grep -q .
+}
+
+# 带错误处理的命令执行
+safe_exec() {
+    local output
+    local status
+    
+    output=$("$@" 2>&1)
+    status=$?
+    
+    if [ $status -ne 0 ]; then
+        echo "$output" >&2
+        return $status
+    fi
+    
+    echo "$output"
     return 0
 }
 
-# ===== 新增：定制化双模极速流程 (已修复 API Key 创建问题) =====
-custom_dual_mode_one_shot() {
-    log "INFO" "======  [极速版] 启动一键双模生成流程 (Gemini + Vertex)  ======"
-    local start_time=$SECONDS
-    local project_prefix="dual-mod"
+# 检查环境
+check_env() {
+    log "INFO" "检查环境配置..."
     
-    # 1. 自动获取结算账户
-    log "INFO" "正在寻找可用结算账户..."
-    local billing_accounts
-    billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null || echo "")
+    # 检查必要命令
+    require_cmd gcloud
     
-    if [ -z "$billing_accounts" ]; then
-        log "ERROR" "错误：未找到任何可用的结算账户，流程终止。"
+    # 检查 gcloud 配置
+    if ! gcloud config list account --quiet &>/dev/null; then
+        log "ERROR" "请先运行 'gcloud init' 初始化"
+        exit 1
+    fi
+    
+    # 检查登录状态
+    local active_account
+    active_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)
+    
+    if [ -z "$active_account" ]; then
+        log "ERROR" "请先运行 'gcloud auth login' 登录"
+        exit 1
+    fi
+    
+    log "SUCCESS" "环境检查通过 (账号: ${active_account})"
+}
+
+# 配额检查（修复版）
+check_quota() {
+    return 0
+}
+
+# 启用服务API
+enable_services() {
+    local proj="$1"
+    shift
+    
+    local services=("$@")
+    
+    # 如果没有指定服务，使用默认列表
+    if [ ${#services[@]} -eq 0 ]; then
+        services=(
+            "aiplatform.googleapis.com"
+            "iam.googleapis.com"
+            "iamcredentials.googleapis.com"
+            "cloudresourcemanager.googleapis.com"
+        )
+    fi
+    
+    log "INFO" "为项目 ${proj} 启用必要的API服务..."
+    
+    local failed=0
+    for svc in "${services[@]}"; do
+        if is_service_enabled "$proj" "$svc"; then
+            log "INFO" "服务 ${svc} 已启用"
+            continue
+        fi
+        
+        log "INFO" "启用服务: ${svc}"
+        if retry gcloud services enable "$svc" --project="$proj" --quiet; then
+            log "SUCCESS" "成功启用服务: ${svc}"
+        else
+            log "ERROR" "无法启用服务: ${svc}"
+            failed=$((failed + 1)) || true
+        fi
+    done
+    
+    if [ $failed -gt 0 ]; then
+        log "WARN" "有 ${failed} 个服务启用失败"
         return 1
     fi
     
+    return 0
+}
+
+# 进度条显示
+show_progress() {
+    local completed="${1:-0}"
+    local total="${2:-1}"
+    
+    # 参数验证
+    if [ "$total" -le 0 ]; then
+        return
+    fi
+    
+    # 确保不超过总数
+    if [ "$completed" -gt "$total" ]; then
+        completed=$total
+    fi
+    
+    # 计算百分比
+    local percent=$((completed * 100 / total))
+    local bar_length=50
+    local filled=$((percent * bar_length / 100))
+    
+    # 生成进度条 - 使用安全的方式循环
+    local bar=""
+    local i=0
+    while [ $i -lt $filled ]; do
+        bar+="█"
+        i=$((i + 1)) || true
+    done
+    
+    i=$filled
+    while [ $i -lt $bar_length ]; do
+        bar+="░"
+        i=$((i + 1)) || true
+    done
+    
+    # 显示进度
+    printf "\r[%s] %3d%% (%d/%d)" "$bar" "$percent" "$completed" "$total"
+    
+    # 完成时换行
+    if [ "$completed" -eq "$total" ]; then
+        echo
+    fi
+}
+
+# JSON解析（改进版本）
+parse_json() {
+    local json="$1"
+    local field="$2"
+    
+    if [ -z "$json" ]; then
+        log "ERROR" "JSON解析: 输入为空"
+        return 1
+    fi
+    
+    # 尝试使用 jq（如果可用）
+    if command -v jq &>/dev/null; then
+        local result
+        result=$(echo "$json" | jq -r "$field" 2>/dev/null)
+        if [ -n "$result" ] && [ "$result" != "null" ]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+    
+    # 备用方法 - 针对keyString专门处理
+    if [ "$field" = ".keyString" ]; then
+        local value
+        # 尝试多种模式匹配
+        value=$(echo "$json" | grep -o '"keyString":"[^"]*"' | sed 's/"keyString":"//;s/"$//' | head -n 1)
+        
+        if [ -z "$value" ]; then
+            # 第二种尝试
+            value=$(echo "$json" | grep -o '"keyString" *: *"[^"]*"' | sed 's/"keyString" *: *"//;s/"$//' | head -n 1)
+        fi
+        
+        if [ -n "$value" ]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+    
+    # 通用字段处理
+    local field_name
+    field_name=$(echo "$field" | sed 's/^\.//; s/\[[0-9]*\]//g')
+    local value
+    value=$(echo "$json" | grep -o "\"$field_name\":[^,}]*" | sed "s/\"$field_name\"://;s/\"//g;s/^ *//;s/ *$//" | head -n 1)
+    
+    if [ -n "$value" ] && [ "$value" != "null" ]; then
+        echo "$value"
+        return 0
+    fi
+    
+    log "WARN" "JSON解析: 无法提取字段 $field"
+    return 1
+}
+
+# 写入密钥文件
+write_keys_to_files() {
+    local api_key="$1"
+    if [ -z "$api_key" ]; then return 1; fi
+    {
+        flock -x 9
+        echo "$api_key" >> "$PURE_KEY_FILE"
+        if [ -s "$COMMA_SEPARATED_KEY_FILE" ]; then echo -n "," >> "$COMMA_SEPARATED_KEY_FILE"; fi
+        echo -n "$api_key" >> "$COMMA_SEPARATED_KEY_FILE"
+    } 9>"${TEMP_DIR}/keyfile.lock"
+}
+
+# 自动解绑结算账户
+unlink_projects_from_billing_account() {
+    local billing_id="$1"
+    if [ -z "$billing_id" ]; then
+        log "ERROR" "调用解绑函数时未提供结算账户ID。"
+        return 1
+    fi
+    log "INFO" "正在检查结算账户 ${billing_id} 是否已关联任何现有项目..."
+    # 查询结算账户关联项目列表
+    local linked_projects
+    linked_projects=$(gcloud billing projects list --billing-account="$billing_id" --format='value(projectId)' 2>/dev/null)
+    if [ -z "$linked_projects" ]; then
+        log "SUCCESS" "结算账户 ${billing_id} 未关联任何项目，无需解绑。"
+        return 0
+    fi
+    log "WARN" "发现以下项目已绑定到此结算账户，将自动解绑以释放配额:"
+    # 转换为数组
+    local project_array=()
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            project_array+=("$line")
+            echo -e "${YELLOW}  - $line${NC}"
+        fi
+    done <<< "$linked_projects"
+    
+    echo
+    log "WARN" "将在 2 秒后开始自动解绑... 按 Ctrl+C 可立即取消。"
+    sleep 2
+    log "INFO" "开始执行解绑操作..."
+    local success=0
+    local failed=0
+    local total_unlink=${#project_array[@]}
+    local current_unlink=0
+    for project_id in "${project_array[@]}"; do
+        current_unlink=$((current_unlink + 1))
+        
+        if retry gcloud billing projects unlink "$project_id" --quiet; then
+            log "SUCCESS" "[${current_unlink}/${total_unlink}] 成功解绑项目: ${project_id}"
+            success=$((success + 1))
+        else
+            log "ERROR" "[${current_unlink}/${total_unlink}] 解绑项目失败: ${project_id}"
+            failed=$((failed + 1))
+        fi
+    done
+    
+    log "INFO" "解绑预处理完成。成功: ${success}, 失败: ${failed}."
+    if [ "$failed" -gt 0 ]; then
+        log "ERROR" "有项目解绑失败，后续操作可能受影响。请检查权限或项目状态。"
+        return 1
+    fi
+    return 0
+}
+
+# =========================================================================
+#  融合极速版流程 (Fusion One-Shot Process)
+#  专门定制：单次执行，失败处理结算，同时提取 Gemini Key 和 Vertex JSON
+# =========================================================================
+fusion_one_shot_process() {
+    echo -e "\n${CYAN}${BOLD}====== 启动融合极速版 (Gemini + Vertex) ======${NC}"
+    log "INFO" "开始执行定制化流程：创建1个项目 -> 智能绑结算 -> 同时提取双模凭证"
+
+    local start_time=$SECONDS
+    local project_prefix="fusion-mod"
+    local gemini_key_file="fusion_gemini_key.txt"
+    
+    # 1. 获取结算账户 (不询问，直接取第一个)
+    log "INFO" "正在获取结算账户..."
+    local billing_accounts
+    billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null || echo "")
+    if [ -z "$billing_accounts" ]; then
+        log "ERROR" "未找到任何开放的结算账户，无法继续。"
+        return 1
+    fi
     local TARGET_BILLING_ID
     TARGET_BILLING_ID=$(echo "$billing_accounts" | head -n 1)
     TARGET_BILLING_ID="${TARGET_BILLING_ID##*/}"
-    log "SUCCESS" "将使用结算账户: ${TARGET_BILLING_ID}"
-    
-    # 2. 创建新项目 (修复：添加 labels 规避环境标签警告)
+    log "SUCCESS" "使用结算账户: ${TARGET_BILLING_ID}"
+
+    # 2. 创建新项目 (不检查配额，直接创建)
     local project_id
     project_id=$(new_project_id "$project_prefix")
-    log "INFO" "正在创建项目: ${project_id} ..."
+    log "INFO" "正在创建项目 ${project_id} ..."
     
-    # 这里加了 labels 参数
-    if ! retry gcloud projects create "$project_id" --labels=environment=development --quiet; then
-        log "ERROR" "创建项目失败，流程终止。"
+    if ! retry gcloud projects create "$project_id" --quiet; then
+        log "ERROR" "创建项目失败，终止流程。"
         return 1
     fi
-    
-    # 3. 乐观绑定结算账户
-    log "INFO" "尝试直接绑定结算账户..."
+
+    # 3. 绑定结算账户 (核心需求：失败则清理旧项目再重试)
+    log "INFO" "正在绑定结算账户..."
     if ! gcloud billing projects link "$project_id" --billing-account="$TARGET_BILLING_ID" --quiet 2>/dev/null; then
-        log "WARN" ">>> 直接绑定失败 (可能配额已满)，启动应急清理程序..."
+        log "WARN" "直接绑定失败 (可能配额已满)，执行清理逻辑..."
         
+        # 调用已有的解绑函数
         if unlink_projects_from_billing_account "$TARGET_BILLING_ID"; then
-            log "INFO" "清理完成，重新尝试绑定..."
-            sleep 2
+            log "INFO" "旧项目清理完毕，重试绑定..."
+            sleep 3
             if ! retry gcloud billing projects link "$project_id" --billing-account="$TARGET_BILLING_ID" --quiet; then
-                log "ERROR" "清理后依然无法绑定结算账户。"
+                log "ERROR" "重试绑定依然失败。请检查结算账户状态。"
                 gcloud projects delete "$project_id" --quiet 2>/dev/null
                 return 1
             fi
         else
-            log "ERROR" "清理过程异常，无法继续。"
+            log "ERROR" "清理过程失败，终止流程。"
             gcloud projects delete "$project_id" --quiet 2>/dev/null
             return 1
         fi
     fi
-    log "SUCCESS" "结算账户绑定成功！"
+    log "SUCCESS" "结算账户绑定成功。"
 
-    # 4. 启用双模 API (修复：添加 apikeys.googleapis.com)
-    log "INFO" "正在并行启用必要 API..."
+    # 4. 启用服务 (合并 Gemini 和 Vertex 所需的所有服务)
+    log "INFO" "正在启用必要 API 服务..."
+    # 注意：这里必须要加 apikeys.googleapis.com 否则 Gemini Key 创建会直接报错，
+    # 但核心逻辑依然遵循原版：generativelanguage + aiplatform
     local services=(
-        "generativelanguage.googleapis.com" # Gemini 模型调用
-        "aiplatform.googleapis.com"         # Vertex AI
-        "apikeys.googleapis.com"            # <--- 必须加这个！否则无法创建 Key
+        "generativelanguage.googleapis.com"
+        "aiplatform.googleapis.com"
         "iam.googleapis.com"
+        "iamcredentials.googleapis.com"
         "cloudresourcemanager.googleapis.com"
+        "apikeys.googleapis.com"
     )
     if ! enable_services "$project_id" "${services[@]}"; then
-        log "ERROR" "服务启用失败，跳过后续步骤。"
+        log "ERROR" "部分服务启用失败。"
         return 1
     fi
 
-    echo -e "\n${YELLOW}>>> 开始提取凭证...${NC}"
-
-    # 5. 同时提取 Gemini Key 和 Vertex JSON
-    
-    # --- 提取 Gemini Key ---
-    local gemini_key=""
+    # 5. 提取 Gemini API Key (逻辑照搬 gemini_create_projects)
+    log "INFO" ">>> 正在生成 Gemini API Key..."
     local key_output
+    local gemini_key=""
     
-    # 修复：去掉了 2>/dev/null，如果有错误直接打印出来
-    # 修复：增加了重试机制，防止 API 刚启用还没生效
-    log "INFO" "正在请求生成 Gemini API Key (最多等待 30秒)..."
-    
-    # 这里的 grep 是为了只看错误，不看正常的 JSON 虽然前面有 log，但为了安全
     if key_output=$(retry gcloud services api-keys create \
-        --project="$project_id" --display-name="Dual Mode Key" \
+        --project="$project_id" --display-name="Gemini API Key" \
         --api-target=service=generativelanguage.googleapis.com \
         --format=json --quiet); then
         
         gemini_key=$(parse_json "$key_output" ".keyString")
+        if [ -n "$gemini_key" ]; then
+            echo "$gemini_key" >> "$gemini_key_file"
+            log "SUCCESS" "Gemini API Key 提取成功: ${gemini_key}"
+        else
+            log "ERROR" "Gemini Key 生成了但无法解析 keyString。"
+        fi
     else
-        log "ERROR" "gcloud 命令执行失败，请检查上方红字报错。"
+        log "ERROR" "Gemini API Key 创建失败。"
     fi
 
-    if [ -n "$gemini_key" ]; then
-        local gemini_file="dual_gemini_keys.txt"
-        echo "$gemini_key" >> "$gemini_file"
-        log "SUCCESS" "Gemini API Key 获取成功: ${gemini_key:0:10}......"
-    else
-        log "ERROR" "未能提取到 Key 字符串 (可能是 API 启用延迟，请稍后重试)。"
-    fi
-
-    # --- 提取 Vertex JSON ---
-    local extracted_json=false
+    # 6. 提取 Vertex JSON (逻辑照搬 vertex_setup_service_account)
+    log "INFO" ">>> 正在配置 Vertex 服务账号..."
+    local sa_status="失败"
+    
+    # 直接调用原有的 logic 块
     if vertex_setup_service_account "$project_id"; then
-        log "SUCCESS" "Vertex Service Account JSON 获取成功"
-        extracted_json=true
+        sa_status="成功"
+        log "SUCCESS" "Vertex JSON 提取成功"
     else
-        log "ERROR" "Vertex JSON 配置失败"
+        log "ERROR" "Vertex JSON 提取失败"
     fi
 
-    # 6. 最终结果汇总
-    echo -e "\n${CYAN}${BOLD}====== 极速双模执行结果 ======${NC}"
-    echo -e "项目ID: ${project_id}"
-    echo -e "耗时: $((SECONDS - start_time)) 秒"
-    
+    # 7. 结束报告
+    local duration=$((SECONDS - start_time))
+    echo -e "\n${CYAN}${BOLD}====== 任务完成 ======${NC}"
+    echo "项目ID: $project_id"
+    echo "耗时: ${duration}秒"
+    echo "--------------------------"
+    echo "Gemini Key: ${gemini_key:-未获取}"
+    echo "Vertex JSON: ${sa_status}"
+    echo "--------------------------"
     if [ -n "$gemini_key" ]; then
-        echo -e "\n${GREEN}[Gemini API Key]:${NC}"
-        echo -e "${BOLD}${gemini_key}${NC}"
-        echo -e "(已保存至 dual_gemini_keys.txt)"
-    fi
-    
-    if [ "$extracted_json" = true ]; then
-        echo -e "\n${GREEN}[Vertex JSON]:${NC}"
-        echo -e "密钥文件已保存至目录: ${KEY_DIR}"
-        local latest_json
-        latest_json=$(ls -t "$KEY_DIR"/*.json 2>/dev/null | head -n 1)
-        [ -n "$latest_json" ] && echo -e "文件: $(basename "$latest_json")"
+        echo "Gemini Key 已保存至: $gemini_key_file"
     fi
     echo
 }
-# =================================
 
-# ===== Gemini 相关函数 (保留旧功能) =====
-gemini_main() {
-    echo -e "\n${CYAN}${BOLD}Gemini API 管理${NC}\n"
-    check_env || return 1
-    echo "1. 自动创建项目并获取Key"
-    echo "2. 从现有项目获取"
-    echo "3. 删除项目"
-    echo "0. 返回"
-    local choice; read -r -p "选择: " choice
-    case "$choice" in
-        1) gemini_create_projects ;;
-        2) gemini_get_keys_from_existing ;;
-        3) gemini_delete_projects ;;
-        0) return 0 ;;
-        *) log "ERROR" "无效选项" ;;
-    esac
-}
-
+# ===== Gemini 相关函数 (保持原样) =====
 gemini_create_projects() {
-    log "INFO" "自动创建3个Gemini项目..."
+    log "INFO" "====== 开始自动创建3个付费Gemini项目 ======"
+    local num_projects=3
+    local project_prefix="gemini-api"
+    log "INFO" "正在自动查找并选择第一个可用的结算账户..."
     local billing_accounts
     billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null || echo "")
-    if [ -z "$billing_accounts" ]; then log "ERROR" "无可用结算账户"; return 1; fi
+    if [ -z "$billing_accounts" ]; then
+        log "ERROR" "未找到任何开放的结算账户。自动化流程无法继续。"
+        return 1
+    fi
     local GEMINI_BILLING_ACCOUNT
     GEMINI_BILLING_ACCOUNT=$(echo "$billing_accounts" | head -n 1)
     GEMINI_BILLING_ACCOUNT="${GEMINI_BILLING_ACCOUNT##*/}"
-    
-    unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"
-    sleep 2
-    
+    log "SUCCESS" "已自动选择结算账户: ${GEMINI_BILLING_ACCOUNT}"
+    log "INFO" "执行预处理：检查并释放结算账户配额..."
+    if ! unlink_projects_from_billing_account "$GEMINI_BILLING_ACCOUNT"; then
+        log "ERROR" "预处理步骤失败，无法继续创建项目。"
+        return 1
+    fi
+    log "WARN" "准备工作完成，3秒后将自动开始创建新项目。按 Ctrl+C 可取消..."
+    sleep 3
     local key_file="gemini_keys_auto_$(date +%Y%m%d_%H%M%S).txt"
+    local csv_file="gemini_keys_auto_$(date +%Y%m%d_%H%M%S).csv"
     > "$key_file"
+    echo -n > "$csv_file"
+    log "INFO" "开始执行项目创建流程..."
+    local success=0
+    local failed=0
     local i=1
-    while [ $i -le 3 ]; do
-        local project_id; project_id=$(new_project_id "gemini-api")
-        if ! retry gcloud projects create "$project_id" --quiet; then i=$((i+1)); continue; fi
-        if ! retry gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
-             gcloud projects delete "$project_id" --quiet; i=$((i+1)); continue
+    while [ $i -le $num_projects ]; do
+        local project_id
+        project_id=$(new_project_id "$project_prefix")
+        if ! retry gcloud projects create "$project_id" --quiet; then
+            log "ERROR" "[${i}/${num_projects}] 创建项目 ${project_id} 失败"
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$((success+failed))" "$num_projects"; continue
         fi
-        retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet
+        if ! retry gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet; then
+            log "ERROR" "[${i}/${num_projects}] 关联结算账户失败: ${project_id}"
+            log "WARN" "正在清理创建失败的项目: ${project_id}..."
+            gcloud projects delete "$project_id" --quiet 2>/dev/null
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$((success+failed))" "$num_projects"; continue
+        fi
+        if ! retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet; then
+            log "ERROR" "[${i}/${num_projects}] 为项目 ${project_id} 启用API失败"
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$((success+failed))" "$num_projects"; continue
+        fi
         local key_output
-        key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet)
-        local api_key; api_key=$(parse_json "$key_output" ".keyString")
-        if [ -n "$api_key" ]; then echo "$api_key" >> "$key_file"; log "SUCCESS" "获取Key: $api_key"; fi
-        i=$((i+1))
+        if ! key_output=$(retry gcloud services api-keys create \
+            --project="$project_id" --display-name="Gemini API Key" \
+            --api-target=service=generativelanguage.googleapis.com \
+            --format=json --quiet); then
+            log "ERROR" "[${i}/${num_projects}] 为项目 ${project_id} 创建API密钥失败"
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$((success+failed))" "$num_projects"; continue
+        fi
+        local api_key
+        api_key=$(parse_json "$key_output" ".keyString")
+        if [ -n "$api_key" ]; then
+            echo "$api_key" >> "$key_file"
+            if [ -s "$csv_file" ]; then echo -n "," >> "$csv_file"; fi
+            echo -n "$api_key" >> "$csv_file"
+            success=$((success + 1))
+        else
+            log "ERROR" "[${i}/${num_projects}] 无法从 ${project_id} 提取API密钥"
+            failed=$((failed + 1))
+        fi
+        show_progress "$((success+failed))" "$num_projects"
+        i=$((i + 1))
     done
+    echo
+    log "SUCCESS" "自动化操作完成！"
+    echo "成功: ${success}, 失败: ${failed}"
+    if [ "$success" -gt 0 ]; then
+        echo "密钥已保存到:"
+        echo "- 每行一个: ${BOLD}${key_file}${NC}"
+        echo "- 逗号分隔: ${BOLD}${csv_file}${NC}"
+        echo -e "\n${CYAN}逗号分隔的密钥内容预览:${NC}"
+        cat "$csv_file"
+        echo
+    fi
 }
 
 gemini_get_keys_from_existing() {
-    # 简化的逻辑，调用gcloud获取key
-    log "INFO" "功能未变动，请参考原版代码..." 
-}
-gemini_delete_projects() {
-    log "INFO" "删除项目逻辑..." 
-    read -r -p "输入前缀删除 (例如 gemini): " prefix
-    if [ -z "$prefix" ]; then return; fi
+    log "INFO" "====== 从现有项目获取Gemini API密钥 ======"
+    log "INFO" "获取项目列表..."
     local projects
-    projects=$(gcloud projects list --format="value(projectId)" --filter="projectId:$prefix*" 2>/dev/null)
-    for p in $projects; do gcloud projects delete "$p" --quiet; done
+    projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
+    if [ -z "$projects" ]; then
+        log "ERROR" "未找到任何活跃项目"
+        return 1
+    fi
+    local project_array=()
+    while IFS= read -r line; do
+        project_array+=("$line")
+    done <<< "$projects"
+    local total=${#project_array[@]}
+    log "INFO" "找到 ${total} 个项目"
+    echo -e "\n项目列表:"
+    local i=0
+    while [ $i -lt $total ] && [ $i -lt 20 ]; do
+        echo "$((i+1)). ${project_array[i]}"
+        i=$((i + 1)) || true
+    done
+    if [ "$total" -gt 20 ]; then
+        echo "... 还有 $((total-20)) 个项目"
+    fi
+    echo -e "\n请选择:"
+    echo "1. 处理特定项目"
+    echo "2. 处理所有项目"
+    echo "0. 取消"
+    local choice
+    read -r -p "请选择 [0-2]: " choice
+    local selected_projects=()
+    case "$choice" in
+        1)
+            read -r -p "请输入项目编号（多个用空格分隔）: " -a numbers
+            for num in "${numbers[@]}"; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+                    selected_projects+=("${project_array[$((num-1))]}")
+                fi
+            done
+            ;;
+        2)
+            selected_projects=("${project_array[@]}")
+            ;;
+        0)
+            log "INFO" "操作已取消"
+            return 0
+            ;;
+        *)
+            log "ERROR" "无效选项"
+            return 1
+            ;;
+    esac
+    if [ ${#selected_projects[@]} -eq 0 ]; then
+        log "ERROR" "未选择任何项目"
+        return 1
+    fi
+    echo -e "\n${YELLOW}将处理 ${#selected_projects[@]} 个项目${NC}"
+    if ! ask_yes_no "确认继续？" "N"; then
+        log "INFO" "操作已取消"
+        return 1
+    fi
+    local key_file="gemini_keys_existing_$(date +%Y%m%d_%H%M%S).txt"
+    local csv_file="gemini_keys_existing_$(date +%Y%m%d_%H%M%S).csv"
+    > "$key_file"
+    echo -n > "$csv_file"
+    local success=0
+    local failed=0
+    local current=0
+    for project_id in "${selected_projects[@]}"; do
+        current=$((current + 1)) || true
+        log "INFO" "[${current}/${#selected_projects[@]}] 处理项目: ${project_id}"
+        if ! retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet; then
+            log "ERROR" "启用API失败: ${project_id}"
+            failed=$((failed + 1)) || true
+            show_progress "$current" "${#selected_projects[@]}"
+            continue
+        fi
+        local keys_list
+        keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+        local got_key=false
+        if [ -n "$keys_list" ]; then
+            local key_name
+            key_name=$(echo "$keys_list" | head -n 1)
+            if [ -n "$key_name" ]; then
+                local key_details
+                key_details=$(gcloud services api-keys get-key-string "$key_name" --format=json 2>/dev/null || echo "")
+                if [ -n "$key_details" ]; then
+                    local api_key
+                    api_key=$(parse_json "$key_details" ".keyString")
+                    if [ -n "$api_key" ]; then
+                        echo "$api_key" >> "$key_file"
+                        if [ -s "$csv_file" ]; then
+                            echo -n "," >> "$csv_file"
+                        fi
+                        echo -n "$api_key" >> "$csv_file"
+                        log "SUCCESS" "获取到现有密钥"
+                        success=$((success + 1)) || true
+                        got_key=true
+                    fi
+                fi
+            fi
+        fi
+        if [ "$got_key" = false ]; then
+            log "INFO" "创建新密钥..."
+            local key_output
+            if key_output=$(retry gcloud services api-keys create \
+                --project="$project_id" \
+                --display-name="Gemini API Key (New)" \
+                --api-target=service=generativelanguage.googleapis.com \
+                --format=json --quiet); then
+                local api_key
+                api_key=$(parse_json "$key_output" ".keyString")
+                if [ -n "$api_key" ]; then
+                    echo "$api_key" >> "$key_file"
+                    if [ -s "$csv_file" ]; then
+                        echo -n "," >> "$csv_file"
+                    fi
+                    echo -n "$api_key" >> "$csv_file"
+                    log "SUCCESS" "成功创建新密钥"
+                    success=$((success + 1)) || true
+                else
+                    log "ERROR" "无法提取密钥"
+                    failed=$((failed + 1)) || true
+                fi
+            else
+                log "ERROR" "创建密钥失败"
+                failed=$((failed + 1)) || true
+            fi
+        fi
+        show_progress "$current" "${#selected_projects[@]}"
+    done
+    echo -e "\n${GREEN}操作完成！${NC}"
+    echo "成功: ${success}, 失败: ${failed}"
+    echo "密钥已保存到:"
+    echo "- 每行一个: ${key_file}"
+    echo "- 逗号分隔: ${csv_file}"
+    if [ "$success" -gt 0 ] && [ -s "$csv_file" ]; then
+        echo -e "\n${CYAN}密钥内容:${NC}"
+        cat "$csv_file"
+        echo
+    fi
 }
 
-# ===== Vertex AI 相关函数 (保留旧功能) =====
-vertex_main() {
-    echo -e "\n${CYAN}${BOLD}Vertex AI 管理${NC}\n"
-    check_env || return 1
-    local billing_accounts
-    billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null | head -n 1)
-    if [ -z "$billing_accounts" ]; then log "ERROR" "无结算账户"; return 1; fi
-    BILLING_ACCOUNT="${billing_accounts##*/}"
-    
-    echo "1. 创建新项目"
-    echo "2. 配置现有项目"
-    echo "0. 返回"
-    local choice; read -r -p "选择: " choice
+gemini_delete_projects() {
+    log "INFO" "====== 删除现有项目 ======"
+    log "INFO" "获取项目列表..."
+    local projects
+    projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
+    if [ -z "$projects" ]; then
+        log "ERROR" "未找到任何活跃项目"
+        return 1
+    fi
+    local project_array=()
+    while IFS= read -r line; do
+        project_array+=("$line")
+    done <<< "$projects"
+    local total=${#project_array[@]}
+    log "INFO" "找到 ${total} 个项目"
+    echo -e "\n项目列表:"
+    local i=0
+    while [ $i -lt $total ] && [ $i -lt 20 ]; do
+        echo "$((i+1)). ${project_array[i]}"
+        i=$((i + 1)) || true
+    done
+    if [ "$total" -gt 20 ]; then
+        echo "... 还有 $((total-20)) 个项目"
+    fi
+    echo -e "\n请选择:"
+    echo "1. 删除特定项目"
+    echo "2. 删除包含特定前缀的项目"
+    echo "0. 取消"
+    local choice
+    read -r -p "请选择 [0-2]: " choice
+    local selected_projects=()
     case "$choice" in
-        1) vertex_create_projects ;;
-        2) vertex_configure_existing ;;
-        0) return 0 ;;
+        1)
+            read -r -p "请输入项目编号（多个用空格分隔）: " -a numbers
+            for num in "${numbers[@]}"; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+                    selected_projects+=("${project_array[$((num-1))]}")
+                fi
+            done
+            ;;
+        2)
+            local prefix
+            read -r -p "请输入项目前缀: " prefix
+            for proj in "${project_array[@]}"; do
+                if [[ "$proj" == "$prefix"* ]]; then
+                    selected_projects+=("$proj")
+                fi
+            done
+            ;;
+        0)
+            log "INFO" "操作已取消"
+            return 0
+            ;;
+        *)
+            log "ERROR" "无效选项"
+            return 1
+            ;;
     esac
+    if [ ${#selected_projects[@]} -eq 0 ]; then
+        log "ERROR" "未选择任何项目"
+        return 1
+    fi
+    echo -e "\n${RED}${BOLD}警告: 即将删除 ${#selected_projects[@]} 个项目！${NC}"
+    echo -e "${RED}此操作不可撤销！${NC}"
+    echo
+    echo "将删除的项目:"
+    for proj in "${selected_projects[@]}"; do
+        echo "  - $proj"
+    done
+    echo
+    read -r -p "请输入 'DELETE' 确认删除: " confirm
+    if [ "$confirm" != "DELETE" ]; then
+        log "INFO" "删除操作已取消"
+        return 1
+    fi
+    local success=0
+    local failed=0
+    local current=0
+    for project_id in "${selected_projects[@]}"; do
+        current=$((current + 1)) || true
+        log "INFO" "[${current}/${#selected_projects[@]}] 删除项目: ${project_id}"
+        if gcloud projects delete "$project_id" --quiet; then
+            log "SUCCESS" "成功删除项目: ${project_id}"
+            success=$((success + 1)) || true
+        else
+            log "ERROR" "删除项目失败: ${project_id}"
+            failed=$((failed + 1)) || true
+        fi
+        show_progress "$current" "${#selected_projects[@]}"
+    done
+    echo -e "\n${GREEN}操作完成！${NC}"
+    echo "成功删除: ${success}"
+    echo "删除失败: ${failed}"
 }
 
 vertex_create_projects() {
-    local project_id; project_id=$(new_project_id "vertex")
-    unlink_projects_from_billing_account "$BILLING_ACCOUNT"
-    retry gcloud projects create "$project_id" --quiet
-    retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet
-    enable_services "$project_id"
-    vertex_setup_service_account "$project_id"
+    log "INFO" "====== 创建新项目并配置 Vertex AI ======"
+    log "INFO" "检查结算账户 ${BILLING_ACCOUNT} 的项目数..."
+    local existing_projects
+    existing_projects=0
+    if [ -n "$BILLING_ACCOUNT" ]; then
+        local project_list
+        project_list=$(gcloud projects list --filter="billingInfo.billingAccountName:billingAccounts/${BILLING_ACCOUNT}" --format='value(projectId)' 2>/dev/null)
+        existing_projects=$(echo "$project_list" | wc -w)
+    fi
+    log "INFO" "当前结算账户已关联 ${existing_projects} 个项目"
+    local max_new=$((MAX_PROJECTS_PER_ACCOUNT - existing_projects))
+    if [ "$max_new" -le 0 ]; then
+        log "WARN" "结算账户已达到或超过最大项目数限制 (${MAX_PROJECTS_PER_ACCOUNT})"
+    fi
+    log "INFO" "每个结算账户建议最多管理 ${MAX_PROJECTS_PER_ACCOUNT} 个项目"
+    local num_projects
+    read -r -p "请输入要创建的项目数量 [默认: 1]: " num_projects
+    num_projects=${num_projects:-1}
+    if ! [[ "$num_projects" =~ ^[0-9]+$ ]] || [ "$num_projects" -lt 1 ]; then
+        log "ERROR" "无效的项目数量"
+        return 1
+    fi
+    local project_prefix
+    read -r -p "请输入项目前缀 (默认: ${VERTEX_PROJECT_PREFIX}): " project_prefix
+    project_prefix=${project_prefix:-$VERTEX_PROJECT_PREFIX}
+    echo -e "\n${YELLOW}即将创建 ${num_projects} 个项目${NC}"
+    echo "项目前缀: ${project_prefix}"
+    echo "结算账户: ${BILLING_ACCOUNT}"
+    echo
+    if ! ask_yes_no "确认继续？" "N"; then
+        log "INFO" "操作已取消"
+        return 1
+    fi
+    log "INFO" "执行预处理：检查并释放结算账户配额..."
+    if ! unlink_projects_from_billing_account "$BILLING_ACCOUNT"; then
+        log "ERROR" "预处理步骤失败，无法继续创建项目。"
+        return 1
+    fi
+    log "INFO" "准备工作完成，即将开始创建新项目..."
+    local success=0
+    local failed=0
+    local i=1
+    while [ $i -le $num_projects ]; do
+        local project_id
+        project_id=$(new_project_id "$project_prefix")
+        log "INFO" "[${i}/${num_projects}] --- 开始处理项目: ${project_id} ---"
+        log "INFO" "步骤 1/4: 创建项目..."
+        if ! retry gcloud projects create "$project_id" --quiet; then
+            log "ERROR" "创建项目失败: ${project_id}"
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$i-1" "$num_projects"; continue
+        fi
+        log "INFO" "步骤 2/4: 关联结算账户..."
+        if ! retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet; then
+            log "ERROR" "关联结算账户失败: ${project_id}"
+            gcloud projects delete "$project_id" --quiet 2>/dev/null
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$i-1" "$num_projects"; continue
+        fi
+        log "INFO" "步骤 3/4: 启用必要的API..."
+        if ! enable_services "$project_id"; then
+            log "ERROR" "启用API失败: ${project_id}"
+            failed=$((failed + 1)); i=$((i + 1)); show_progress "$i-1" "$num_projects"; continue
+        fi
+        log "INFO" "步骤 4/4: 配置服务账号并生成密钥..."
+        if vertex_setup_service_account "$project_id"; then
+            log "SUCCESS" "成功配置项目: ${project_id}"
+            success=$((success + 1))
+        else
+            log "ERROR" "配置服务账号失败: ${project_id}"
+            failed=$((failed + 1))
+        fi
+        show_progress "$i" "$num_projects"
+        sleep 2
+        i=$((i + 1))
+    done
+    echo
+    log "SUCCESS" "操作完成！"
+    echo "成功: ${success}, 失败: ${failed}"
+    if [ "$success" -gt 0 ]; then
+        log "INFO" "服务账号密钥已保存在目录: ${KEY_DIR}"
+    fi
 }
 
 vertex_configure_existing() {
-     log "INFO" "功能未变动，请参考原版代码..."
+    log "INFO" "====== 在现有项目上配置 Vertex AI ======"
+    log "INFO" "获取项目列表..."
+    local projects
+    local all_projects
+    all_projects=$(gcloud projects list --format='value(projectId)' --filter="lifecycleState=ACTIVE" 2>/dev/null || echo "")
+    local projects=""
+    while IFS= read -r project_id; do
+        if [ -n "$project_id" ]; then
+            local billing_info
+            billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
+            if [ -n "$billing_info" ] && [[ "$billing_info" == *"${BILLING_ACCOUNT}"* ]]; then
+                projects="${projects}${projects:+$'\n'}${project_id}"
+            fi
+        fi
+    done <<< "$all_projects"
+    if [ -z "$projects" ]; then
+        log "WARN" "未找到与当前结算账户关联的项目"
+        echo -e "\n${YELLOW}请选择操作:${NC}"
+        echo "1. 显示所有项目（包括未关联当前结算账户的项目）"
+        echo "2. 返回上级菜单"
+        local list_choice
+        read -r -p "请选择 [1-2]: " list_choice
+        case "$list_choice" in
+            1)
+                log "INFO" "显示所有活跃项目"
+                projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
+                ;;
+            *)
+                log "INFO" "返回上级菜单"
+                return 0
+                ;;
+        esac
+    else
+        log "INFO" "找到与结算账户 ${BILLING_ACCOUNT} 关联的项目"
+    fi
+    if [ -z "$projects" ]; then
+        log "ERROR" "未找到任何活跃项目"
+        return 1
+    fi
+    local project_array=()
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            project_array+=("$line")
+        fi
+    done <<< "$projects"
+    local total=${#project_array[@]}
+    if [ "$total" -eq 0 ]; then
+        log "WARN" "未找到与当前结算账户关联的项目"
+        echo -e "\n${YELLOW}请选择操作:${NC}"
+        echo "1. 显示所有项目（包括未关联当前结算账户的项目）"
+        echo "2. 返回上级菜单"
+        local list_choice
+        read -r -p "请选择 [1-2]: " list_choice
+        case "$list_choice" in
+            1)
+                log "INFO" "显示所有活跃项目"
+                while IFS= read -r line; do
+                    if [ -n "$line" ]; then
+                        project_array+=("$line")
+                    fi
+                done <<< "$all_projects"
+                total=${#project_array[@]}
+                ;;
+            *)
+                log "INFO" "返回上级菜单"
+                return 0
+                ;;
+        esac
+    else
+        log "INFO" "找到 ${total} 个与当前结算账户关联的项目"
+    fi
+    echo -e "\n项目列表:"
+    for ((i=0; i<total && i<20; i++)); do
+        local billing_info
+        billing_info=$(gcloud billing projects describe "${project_array[i]}" --format='value(billingAccountName)' 2>/dev/null || echo "")
+        local status=""
+        if [ -n "$billing_info" ] && [[ "$billing_info" == *"${BILLING_ACCOUNT}"* ]]; then
+            status="(已关联当前结算账户)"
+        elif [ -n "$billing_info" ]; then
+            status="(关联了其他结算账户)"
+        else
+            status="(未关联结算)"
+        fi
+        echo "$((i+1)). ${project_array[i]} ${status}"
+    done
+    if [ "$total" -gt 20 ]; then
+        echo "... 还有 $((total-20)) 个项目"
+    fi
+    local selected_projects=()
+    read -r -p "请输入项目编号（多个用空格分隔）: " -a numbers
+    for num in "${numbers[@]}"; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+            selected_projects+=("${project_array[$((num-1))]}")
+        fi
+    done
+    if [ ${#selected_projects[@]} -eq 0 ]; then
+        log "ERROR" "未选择任何项目"
+        return 1
+    fi
+    echo -e "\n${YELLOW}将为 ${#selected_projects[@]} 个项目配置 Vertex AI${NC}"
+    if ! ask_yes_no "确认继续？" "N"; then
+        log "INFO" "操作已取消"
+        return 1
+    fi
+    local success=0
+    local failed=0
+    local current=0
+    for project_id in "${selected_projects[@]}"; do
+        current=$((current + 1)) || true
+        log "INFO" "[${current}/${#selected_projects[@]}] 处理项目: ${project_id}"
+        local billing_info
+        billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
+        if [ -z "$billing_info" ]; then
+            log "WARN" "项目未关联结算账户，尝试关联..."
+            if ! retry gcloud billing projects link "$project_id" --billing-account="$BILLING_ACCOUNT" --quiet; then
+                log "ERROR" "关联结算账户失败: ${project_id}"
+                failed=$((failed + 1)) || true
+                show_progress "$current" "${#selected_projects[@]}"
+                continue
+            fi
+        fi
+        log "INFO" "启用必要的API..."
+        if ! enable_services "$project_id"; then
+            log "ERROR" "启用API失败: ${project_id}"
+            failed=$((failed + 1)) || true
+            show_progress "$current" "${#selected_projects[@]}"
+            continue
+        fi
+        log "INFO" "配置服务账号..."
+        if vertex_setup_service_account "$project_id"; then
+            log "SUCCESS" "成功配置项目: ${project_id}"
+            success=$((success + 1)) || true
+        else
+            log "ERROR" "配置服务账号失败: ${project_id}"
+            failed=$((failed + 1)) || true
+        fi
+        show_progress "$current" "${#selected_projects[@]}"
+    done
+    echo -e "\n${GREEN}操作完成！${NC}"
+    echo "成功: ${success}, 失败: ${failed}"
+    echo "服务账号密钥已保存在: ${KEY_DIR}"
 }
 
 vertex_setup_service_account() {
     local project_id="$1"
     local sa_email="${SERVICE_ACCOUNT_NAME}@${project_id}.iam.gserviceaccount.com"
-    
     if ! gcloud iam service-accounts describe "$sa_email" --project="$project_id" &>/dev/null; then
-        retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" --display-name="Vertex SA" --project="$project_id" --quiet
+        log "INFO" "创建服务账号..."
+        if ! retry gcloud iam service-accounts create "$SERVICE_ACCOUNT_NAME" \
+            --display-name="Vertex AI Service Account" \
+            --project="$project_id" --quiet; then
+            log "ERROR" "创建服务账号失败"
+            return 1
+        fi
+    else
+        log "INFO" "服务账号已存在"
     fi
-    
-    local roles=("roles/aiplatform.user" "roles/aiplatform.admin" "roles/iam.serviceAccountUser") 
+    local roles=(
+        "roles/aiplatform.admin"
+        "roles/iam.serviceAccountUser"
+        "roles/iam.serviceAccountTokenCreator"
+        "roles/aiplatform.user"
+    )
+    log "INFO" "分配IAM角色..."
     for role in "${roles[@]}"; do
-        gcloud projects add-iam-policy-binding "$project_id" --member="serviceAccount:${sa_email}" --role="$role" --quiet &>/dev/null
+        if retry gcloud projects add-iam-policy-binding "$project_id" \
+            --member="serviceAccount:${sa_email}" \
+            --role="$role" \
+            --quiet &>/dev/null; then
+            log "SUCCESS" "授予角色: ${role}"
+        else
+            log "WARN" "授予角色失败: ${role}"
+        fi
     done
-    
-    local key_file="${KEY_DIR}/${project_id}.json"
-    if retry gcloud iam service-accounts keys create "$key_file" --iam-account="$sa_email" --project="$project_id" --quiet 2>/dev/null; then
+    log "INFO" "生成服务账号密钥..."
+    local key_file="${KEY_DIR}/${project_id}-${SERVICE_ACCOUNT_NAME}-$(date +%Y%m%d-%H%M%S).json"
+    if retry gcloud iam service-accounts keys create "$key_file" \
+        --iam-account="$sa_email" \
+        --project="$project_id" \
+        --quiet; then
         chmod 600 "$key_file"
+        log "SUCCESS" "密钥已保存: ${key_file}"
         return 0
+    else
+        log "ERROR" "生成密钥失败"
+        return 1
     fi
-    return 1
 }
 
-# ===== 主菜单 =====
-show_menu() {
-    echo -e "\n${CYAN}${BOLD}====== GCP Tool v${VERSION} ======${NC}"
-    echo "1. Gemini API 管理"
-    echo "2. Vertex AI 管理"
-    echo "3. 设置"
-    echo "4. 帮助"
-    echo -e "${YELLOW}5. [极速版] 一键双模 (Gemini Key + Vertex JSON)${NC}" 
-    echo "0. 退出"
-    
+vertex_manage_keys() {
+    log "INFO" "====== 管理服务账号密钥 ======"
+    echo "请选择操作:"
+    echo "1. 列出所有服务账号密钥"
+    echo "2. 生成新密钥"
+    echo "3. 删除旧密钥"
+    echo "0. 返回"
+    echo
     local choice
-    read -r -p "请选择: " choice
+    read -r -p "请选择 [0-3]: " choice
     case "$choice" in
-        1) gemini_main ;;
-        2) vertex_main ;;
-        5) custom_dual_mode_one_shot ;; 
-        0) exit 0 ;;
-        *) ;; 
+        1) vertex_list_keys ;;
+        2) vertex_generate_keys ;;
+        3) vertex_delete_keys ;;
+        0) return 0 ;;
+        *) log "ERROR" "无效选项"; return 1 ;;
     esac
 }
 
-# 运行主程序
+vertex_list_keys() {
+    log "INFO" "扫描密钥目录: ${KEY_DIR}"
+    if [ ! -d "$KEY_DIR" ]; then
+        log "ERROR" "密钥目录不存在"
+        return 1
+    fi
+    local key_files=()
+    while IFS= read -r -d '' file; do
+        key_files+=("$file")
+    done < <(find "$KEY_DIR" -name "*.json" -type f -print0 2>/dev/null)
+    if [ ${#key_files[@]} -eq 0 ]; then
+        log "INFO" "未找到任何密钥文件"
+        return 0
+    fi
+    echo -e "\n找到 ${#key_files[@]} 个密钥文件:"
+    for ((i=0; i<${#key_files[@]}; i++)); do
+        local filename
+        filename=$(basename "${key_files[i]}")
+        local size
+        size=$(stat -f%z "${key_files[i]}" 2>/dev/null || stat -c%s "${key_files[i]}" 2>/dev/null || echo "unknown")
+        echo "$((i+1)). ${filename} (${size} bytes)"
+    done
+}
+
+# ===== 主菜单 =====
+
+show_menu() {
+    echo -e "\n${CYAN}${BOLD}======================================================"
+    echo -e "     GCP API 密钥管理工具 v${VERSION}"
+    echo -e "     更新日期: ${LAST_UPDATED}"
+    echo -e "======================================================${NC}\n"
+    local current_account
+    current_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1)
+    local current_project
+    current_project=$(gcloud config get-value project 2>/dev/null || echo "未设置")
+    echo "当前账号: ${current_account:-未登录}"
+    echo "当前项目: ${current_project}"
+    echo
+    echo -e "${RED}${BOLD}⚠️  风险提示 ⚠️${NC}"
+    echo -e "${YELLOW}• Gemini API 批量创建可能导致账号被封${NC}"
+    echo -e "${YELLOW}• Vertex AI 会产生实际费用${NC}"
+    echo
+    echo "请选择功能:"
+    echo "1. Gemini API 密钥管理"
+    echo "2. Vertex AI 密钥管理"
+    echo "3. 设置和配置"
+    echo "4. 帮助文档"
+    echo -e "${GREEN}5. [融合极速版] Gemini Key + Vertex JSON (单次执行)${NC}" # 新增入口
+    echo "0. 退出"
+    echo
+    local choice
+    read -r -p "请选择 [0-5]: " choice
+    case "$choice" in
+        1) gemini_main ;;
+        2) vertex_main ;;
+        3) show_settings ;;
+        4) show_help ;;
+        5) fusion_one_shot_process ;; # 调用新函数
+        0) exit 0 ;;
+        *) log "ERROR" "无效选项" ;;
+    esac
+}
+
+show_settings() {
+    echo -e "\n${CYAN}${BOLD}====== 设置和配置 ======${NC}\n"
+    echo "当前配置:"
+    echo "1. 项目前缀: ${PROJECT_PREFIX}"
+    echo "2. 最大重试次数: ${MAX_RETRY_ATTEMPTS}"
+    echo "3. 并行任务数: ${MAX_PARALLEL_JOBS}"
+    echo "4. Vertex密钥目录: ${KEY_DIR}"
+    echo "5. Vertex服务账号名: ${SERVICE_ACCOUNT_NAME}"
+    echo "6. 每账户最大项目数: ${MAX_PROJECTS_PER_ACCOUNT}"
+    echo "0. 返回主菜单"
+    echo
+    local choice
+    read -r -p "请选择要修改的设置 [0-6]: " choice
+    case "$choice" in
+        1)
+            read -r -p "请输入新的项目前缀: " new_value
+            if [[ "$new_value" =~ ^[a-z][a-z0-9-]{0,20}$ ]]; then
+                PROJECT_PREFIX="$new_value"
+                log "SUCCESS" "项目前缀已更新"
+            else
+                log "ERROR" "无效的项目前缀格式"
+            fi
+            ;;
+        2)
+            read -r -p "请输入最大重试次数 [1-10]: " new_value
+            if [[ "$new_value" =~ ^[0-9]+$ ]] && [ "$new_value" -ge 1 ] && [ "$new_value" -le 10 ]; then
+                MAX_RETRY_ATTEMPTS="$new_value"
+                log "SUCCESS" "最大重试次数已更新"
+            else
+                log "ERROR" "无效的数值"
+            fi
+            ;;
+        3)
+            read -r -p "请输入并行任务数 [1-50]: " new_value
+            if [[ "$new_value" =~ ^[0-9]+$ ]] && [ "$new_value" -ge 1 ] && [ "$new_value" -le 50 ]; then
+                MAX_PARALLEL_JOBS="$new_value"
+                log "SUCCESS" "并行任务数已更新"
+            else
+                log "ERROR" "无效的数值"
+            fi
+            ;;
+        4)
+            read -r -p "请输入密钥目录路径: " new_value
+            if [ -n "$new_value" ]; then
+                KEY_DIR="$new_value"
+                mkdir -p "$KEY_DIR" 2>/dev/null
+                log "SUCCESS" "密钥目录已更新"
+            fi
+            ;;
+        5)
+            read -r -p "请输入服务账号名称: " new_value
+            if [[ "$new_value" =~ ^[a-z][a-z0-9-]{0,20}$ ]]; then
+                SERVICE_ACCOUNT_NAME="$new_value"
+                log "SUCCESS" "服务账号名称已更新"
+            else
+                log "ERROR" "无效的服务账号名称格式"
+            fi
+            ;;
+        6)
+            read -r -p "请输入每账户最大项目数 [1-10]: " new_value
+            if [[ "$new_value" =~ ^[0-9]+$ ]] && [ "$new_value" -ge 1 ] && [ "$new_value" -le 10 ]; then
+                MAX_PROJECTS_PER_ACCOUNT="$new_value"
+                log "SUCCESS" "每账户最大项目数已更新"
+            else
+                log "ERROR" "无效的数值"
+            fi
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log "ERROR" "无效选项"
+            ;;
+    esac
+    sleep 1
+    show_settings
+}
+
 main() {
-    while true; do show_menu; done
+    echo -e "${CYAN}${BOLD}"
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║          GCP API 密钥管理工具 v${VERSION}              ║"
+    echo "║                                                       ║"
+    echo "║          支持 Gemini API 和 Vertex AI                 ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    check_env
+    while true; do
+        show_menu
+    done
 }
 
 main
-
