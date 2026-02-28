@@ -211,7 +211,7 @@ unlink_projects_from_billing_account() {
     return 0
 }
 
-# ===== 新增：定制化双模极速流程 =====
+# ===== 新增：定制化双模极速流程 (已修复 API Key 创建问题) =====
 custom_dual_mode_one_shot() {
     log "INFO" "======  [极速版] 启动一键双模生成流程 (Gemini + Vertex)  ======"
     local start_time=$SECONDS
@@ -227,34 +227,32 @@ custom_dual_mode_one_shot() {
         return 1
     fi
     
-    # 自动选择第一个
     local TARGET_BILLING_ID
     TARGET_BILLING_ID=$(echo "$billing_accounts" | head -n 1)
     TARGET_BILLING_ID="${TARGET_BILLING_ID##*/}"
     log "SUCCESS" "将使用结算账户: ${TARGET_BILLING_ID}"
     
-    # 2. 创建新项目 (直接执行，不检查)
+    # 2. 创建新项目 (修复：添加 labels 规避环境标签警告)
     local project_id
     project_id=$(new_project_id "$project_prefix")
     log "INFO" "正在创建项目: ${project_id} ..."
     
-    if ! retry gcloud projects create "$project_id" --quiet; then
+    # 这里加了 labels 参数
+    if ! retry gcloud projects create "$project_id" --labels=environment=development --quiet; then
         log "ERROR" "创建项目失败，流程终止。"
         return 1
     fi
     
-    # 3. 乐观绑定结算账户 (关键逻辑修改)
+    # 3. 乐观绑定结算账户
     log "INFO" "尝试直接绑定结算账户..."
     if ! gcloud billing projects link "$project_id" --billing-account="$TARGET_BILLING_ID" --quiet 2>/dev/null; then
         log "WARN" ">>> 直接绑定失败 (可能配额已满)，启动应急清理程序..."
         
-        # 触发清理逻辑
         if unlink_projects_from_billing_account "$TARGET_BILLING_ID"; then
             log "INFO" "清理完成，重新尝试绑定..."
             sleep 2
             if ! retry gcloud billing projects link "$project_id" --billing-account="$TARGET_BILLING_ID" --quiet; then
-                log "ERROR" "清理后依然无法绑定结算账户，可能达到硬性上限或账号被风控。"
-                # 清理刚才创建的空壳项目
+                log "ERROR" "清理后依然无法绑定结算账户。"
                 gcloud projects delete "$project_id" --quiet 2>/dev/null
                 return 1
             fi
@@ -266,11 +264,12 @@ custom_dual_mode_one_shot() {
     fi
     log "SUCCESS" "结算账户绑定成功！"
 
-    # 4. 启用双模 API (Gemini + Vertex)
-    log "INFO" "正在并行启用 Gemini 和 Vertex API..."
+    # 4. 启用双模 API (修复：添加 apikeys.googleapis.com)
+    log "INFO" "正在并行启用必要 API..."
     local services=(
-        "generativelanguage.googleapis.com" # Gemini
-        "aiplatform.googleapis.com"         # Vertex
+        "generativelanguage.googleapis.com" # Gemini 模型调用
+        "aiplatform.googleapis.com"         # Vertex AI
+        "apikeys.googleapis.com"            # <--- 必须加这个！否则无法创建 Key
         "iam.googleapis.com"
         "cloudresourcemanager.googleapis.com"
     )
@@ -286,19 +285,28 @@ custom_dual_mode_one_shot() {
     # --- 提取 Gemini Key ---
     local gemini_key=""
     local key_output
-    if key_output=$(gcloud services api-keys create \
+    
+    # 修复：去掉了 2>/dev/null，如果有错误直接打印出来
+    # 修复：增加了重试机制，防止 API 刚启用还没生效
+    log "INFO" "正在请求生成 Gemini API Key (最多等待 30秒)..."
+    
+    # 这里的 grep 是为了只看错误，不看正常的 JSON 虽然前面有 log，但为了安全
+    if key_output=$(retry gcloud services api-keys create \
         --project="$project_id" --display-name="Dual Mode Key" \
         --api-target=service=generativelanguage.googleapis.com \
-        --format=json --quiet 2>/dev/null); then
+        --format=json --quiet); then
+        
         gemini_key=$(parse_json "$key_output" ".keyString")
+    else
+        log "ERROR" "gcloud 命令执行失败，请检查上方红字报错。"
     fi
 
     if [ -n "$gemini_key" ]; then
         local gemini_file="dual_gemini_keys.txt"
         echo "$gemini_key" >> "$gemini_file"
-        log "SUCCESS" "Gemini API Key 获取成功"
+        log "SUCCESS" "Gemini API Key 获取成功: ${gemini_key:0:10}......"
     else
-        log "ERROR" "Gemini API Key 获取失败"
+        log "ERROR" "未能提取到 Key 字符串 (可能是 API 启用延迟，请稍后重试)。"
     fi
 
     # --- 提取 Vertex JSON ---
@@ -324,7 +332,6 @@ custom_dual_mode_one_shot() {
     if [ "$extracted_json" = true ]; then
         echo -e "\n${GREEN}[Vertex JSON]:${NC}"
         echo -e "密钥文件已保存至目录: ${KEY_DIR}"
-        # 显示最新的一个json文件
         local latest_json
         latest_json=$(ls -t "$KEY_DIR"/*.json 2>/dev/null | head -n 1)
         [ -n "$latest_json" ] && echo -e "文件: $(basename "$latest_json")"
@@ -475,3 +482,4 @@ main() {
 }
 
 main
+
