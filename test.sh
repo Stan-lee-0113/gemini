@@ -3,7 +3,7 @@
 # 支持 Gemini API 和 Vertex AI (自动计费检测 + 自定义数量 + 屏幕展示)
 # 版本: 3.2.0
 
-set -Euo
+set -Euo pipefail
 
 # ===== 颜色定义 =====
 RED='\033[0;31m'
@@ -83,11 +83,14 @@ parse_json() {
   local json="$1"; local field="$2"
   if [ -z "$json" ]; then return 1; fi
   if command -v jq &>/dev/null; then
-    local res=$(echo "$json" | jq -r "$field" 2>/dev/null)
+    local res
+    res=$(echo "$json" | jq -r "$field" 2>/dev/null)
+    if [ -n "$res" ] && [ "$res" != "null" ]; then echo "$res"; return 0; fi
+    res=$(echo "$json" | jq -r ".response${field}" 2>/dev/null)
     if [ -n "$res" ] && [ "$res" != "null" ]; then echo "$res"; return 0; fi
   fi
   if [ "$field" = ".keyString" ]; then
-    echo "$json" | grep -o '"keyString":"[^"]*"' | sed 's/"keyString":"//;s/"$//' | head -n 1
+    echo "$json" | grep -o '"keyString" *: *"[^"]*"' | sed 's/"keyString" *: *"//;s/"$//' | head -n 1
   fi
 }
 
@@ -132,9 +135,11 @@ gemini_create_projects() {
     num_projects=3
   fi
 
-  local billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null || echo "")
+  local billing_accounts
+  billing_accounts=$(gcloud billing accounts list --filter='open=true' --format='value(name)' 2>/dev/null || echo "")
   if [ -z "$billing_accounts" ]; then log "ERROR" "未找到开放的结算账户喵！"; return 1; fi
-  local GEMINI_BILLING_ACCOUNT=$(echo "$billing_accounts" | head -n 1)
+  local GEMINI_BILLING_ACCOUNT
+  GEMINI_BILLING_ACCOUNT=$(echo "$billing_accounts" | head -n 1)
   GEMINI_BILLING_ACCOUNT="${GEMINI_BILLING_ACCOUNT##*/}"
   
   log "INFO" "使用结算账户: ${GEMINI_BILLING_ACCOUNT}"
@@ -156,7 +161,8 @@ gemini_create_projects() {
     retry gcloud projects create "$project_id" --quiet || { failed=$((failed+1)); i=$((i+1)); continue; }
     retry gcloud billing projects link "$project_id" --billing-account="$GEMINI_BILLING_ACCOUNT" --quiet || true
     
-    local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
+    local billing_info
+    billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
     if [ -z "$billing_info" ]; then
       log "WARN" "项目 ${project_id} 未绑定结算账户，跳过密钥提取喵！"
       skipped=$((skipped+1)); i=$((i+1)); continue
@@ -164,17 +170,27 @@ gemini_create_projects() {
     
     retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || { failed=$((failed+1)); i=$((i+1)); continue; }
     
-    local key_output
-    if key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet); then
-      local api_key=$(parse_json "$key_output" ".keyString")
-      if [ -n "$api_key" ]; then
-        echo "$api_key" >> "$key_file"
-        log "SUCCESS" "成功提取密钥！"
-        success=$((success+1))
-      else
-        failed=$((failed+1))
+    local key_output=""
+    key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet) || true
+    local api_key
+    api_key=$(parse_json "$key_output" ".keyString") || true
+
+    if [ -z "$api_key" ]; then
+      local created_key_name
+      created_key_name=$(gcloud services api-keys list --project="$project_id" --format='value(name)' --limit=1 2>/dev/null | head -n 1 || echo "")
+      if [ -n "$created_key_name" ]; then
+        local fallback_details
+        fallback_details=$(gcloud services api-keys get-key-string "$created_key_name" --format=json 2>/dev/null || echo "")
+        api_key=$(parse_json "$fallback_details" ".keyString") || true
       fi
+    fi
+
+    if [ -n "$api_key" ]; then
+      echo "$api_key" >> "$key_file"
+      log "SUCCESS" "成功提取密钥！"
+      success=$((success+1))
     else
+      log "WARN" "项目 ${project_id} 密钥解析失败"
       failed=$((failed+1))
     fi
     i=$((i+1))
@@ -192,7 +208,8 @@ gemini_create_projects() {
 
 gemini_get_keys_from_existing() {
   log "INFO" "====== 从现有项目提取密钥 ======"
-  local projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
+  local projects
+  projects=$(gcloud projects list --format='value(projectId)' --filter='lifecycleState:ACTIVE' 2>/dev/null || echo "")
   if [ -z "$projects" ]; then log "ERROR" "没找到活跃项目喵！"; return 1; fi
   
   local key_file="existing_keys_$(date +%Y%m%d_%H%M%S).txt"
@@ -203,7 +220,8 @@ gemini_get_keys_from_existing() {
     [ -z "$project_id" ] && continue
     
     # 检测结算账户
-    local billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
+    local billing_info
+    billing_info=$(gcloud billing projects describe "$project_id" --format='value(billingAccountName)' 2>/dev/null || echo "")
     if [ -z "$billing_info" ]; then
       log "WARN" "项目 ${project_id} 无结算账户，喵酱跳过啦！"
       skipped=$((skipped+1))
@@ -213,13 +231,17 @@ gemini_get_keys_from_existing() {
     log "INFO" "正在提取项目: ${project_id}"
     retry gcloud services enable generativelanguage.googleapis.com --project="$project_id" --quiet || continue
     
-    local keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
+    local keys_list
+    keys_list=$(gcloud services api-keys list --project="$project_id" --format='value(name)' 2>/dev/null || echo "")
     local key_found=false
 
     if [ -n "$keys_list" ]; then
-      local key_name=$(echo "$keys_list" | head -n 1)
-      local key_details=$(gcloud services api-keys get-key-string "$key_name" --format=json 2>/dev/null)
-      local api_key=$(parse_json "$key_details" ".keyString")
+      local key_name
+      key_name=$(echo "$keys_list" | head -n 1)
+      local key_details
+      key_details=$(gcloud services api-keys get-key-string "$key_name" --format=json 2>/dev/null || echo "")
+      local api_key
+      api_key=$(parse_json "$key_details" ".keyString") || true
       if [ -n "$api_key" ]; then
         echo "$api_key" >> "$key_file"
         success=$((success+1))
@@ -228,10 +250,22 @@ gemini_get_keys_from_existing() {
       fi
     fi
     
-    # 如果没有现有密钥则创建
     if [ "$key_found" = false ]; then
-      local key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet)
-      local new_key=$(parse_json "$key_output" ".keyString")
+      local key_output=""
+      key_output=$(retry gcloud services api-keys create --project="$project_id" --display-name="Gemini API Key" --api-target=service=generativelanguage.googleapis.com --format=json --quiet) || true
+      local new_key
+      new_key=$(parse_json "$key_output" ".keyString") || true
+
+      if [ -z "$new_key" ]; then
+        local created_key_name
+        created_key_name=$(gcloud services api-keys list --project="$project_id" --format='value(name)' --limit=1 2>/dev/null | head -n 1 || echo "")
+        if [ -n "$created_key_name" ]; then
+          local fallback_details
+          fallback_details=$(gcloud services api-keys get-key-string "$created_key_name" --format=json 2>/dev/null || echo "")
+          new_key=$(parse_json "$fallback_details" ".keyString") || true
+        fi
+      fi
+
       if [ -n "$new_key" ]; then
         echo "$new_key" >> "$key_file"
         success=$((success+1))
@@ -254,7 +288,8 @@ gemini_delete_projects() {
   log "INFO" "====== 删除现有项目 ======"
   read -r -p "输入项目前缀进行批量删除 (留空取消): " prefix
   if [ -z "$prefix" ]; then return 0; fi
-  local projects=$(gcloud projects list --format="value(projectId)" --filter="projectId:$prefix*" 2>/dev/null)
+  local projects
+  projects=$(gcloud projects list --format="value(projectId)" --filter="projectId:$prefix*" 2>/dev/null || echo "")
   for p in $projects; do
     log "INFO" "正在删除 $p ..."
     gcloud projects delete "$p" --quiet
